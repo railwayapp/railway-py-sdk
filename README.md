@@ -28,3 +28,6 @@ Last resort only: set module-level `PARTIAL = "api"` (same role as
 `export const partial` in TypeScript). Do not rename a partial after apply.
 
 See https://docs.railway.com/infrastructure-as-code
+
+Contributing and the release process (release labels, PyPI publishing) are
+described in [CONTRIBUTING.md](CONTRIBUTING.md).

@@ -1,0 +1,32 @@
+name: Release Label
+
+on:
+  pull_request:
+    types: [opened, reopened, synchronize, labeled, unlabeled, ready_for_review]
+
+permissions:
+  pull-requests: read
+
+jobs:
+  release-label:
+    name: Require release label
+    runs-on: ubuntu-latest
+    steps:
+      - name: Check release label
+        env:
+          LABELS: ${{ join(github.event.pull_request.labels.*.name, ' ') }}
+        run: |
+          set -euo pipefail
+          found=()
+          for label in $LABELS; do
+            case "$label" in
+              release/patch|release/minor|release/major|release/skip) found+=("$label") ;;
+            esac
+          done
+
+          if [ "${#found[@]}" -ne 1 ]; then
+            echo "Expected exactly one release label (release/patch, release/minor, release/major, release/skip); found ${#found[@]}: ${found[*]:-none}" >&2
+            exit 1
+          fi
+
+          echo "Release label: ${found[0]}"

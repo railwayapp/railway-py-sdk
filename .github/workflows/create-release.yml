@@ -1,0 +1,71 @@
+name: Create Release
+
+on:
+  workflow_dispatch:
+    inputs:
+      bump:
+        description: Version bump type, or current to tag the current package version
+        required: true
+        type: choice
+        options:
+          - current
+          - patch
+          - minor
+          - major
+
+concurrency:
+  group: release-bump
+  cancel-in-progress: false
+
+permissions:
+  actions: write
+  contents: write
+
+jobs:
+  create-release:
+    name: Create release tag
+    runs-on: ubuntu-latest
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@v4
+        with:
+          ref: main
+          fetch-depth: 0
+
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+
+      - name: Configure git
+        run: |
+          git config user.name "github-actions[bot]"
+          git config user.email "github-actions[bot]@users.noreply.github.com"
+
+      - name: Set version and tag
+        id: version
+        run: |
+          set -euo pipefail
+          VERSION=$(python scripts/bump_version.py ${{ inputs.bump }})
+          if [ "${{ inputs.bump }}" != "current" ]; then
+            git add pyproject.toml
+            git commit -m "chore: release v$VERSION"
+          fi
+
+          git tag "v$VERSION"
+          echo "version=$VERSION" >> "$GITHUB_OUTPUT"
+
+      - name: Push changes and tag
+        run: |
+          set -euo pipefail
+          if [ "${{ inputs.bump }}" != "current" ]; then
+            git push --atomic origin main "v${{ steps.version.outputs.version }}"
+          else
+            git push origin "v${{ steps.version.outputs.version }}"
+          fi
+
+      - name: Dispatch release workflow
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+          GH_REPO: ${{ github.repository }}
+          TAG: v${{ steps.version.outputs.version }}
+        run: gh workflow run release.yml --ref main -f tag="$TAG"
