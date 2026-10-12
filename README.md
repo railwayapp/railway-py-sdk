@@ -21,29 +21,29 @@ def main(ctx=None):
     return project("my-app", resources=[db, web])
 ```
 
-Functions are single-file services run by Railway's function image. Pass the
-source as `code` and `fn` compiles it to the image plus the base64 start command
-that the dashboard editor and `railway functions push` write — the same thing
-you would get by hand with `source=image(...)` and `start="./run.sh <base64>"`.
-Source is capped at 96 KB, checked at authoring time.
+Functions are single-file services run by Railway's function image. Point
+`fn` at the file with `code_file` (relative to the config file) and it reads it
+when the config is evaluated, compiling it to the image plus the base64 start
+command that the dashboard editor and `railway functions push` write — the same
+thing you would get by hand with `source=image(...)` and
+`start="./run.sh <base64>"`. Source is capped at 96 KB, checked at authoring
+time.
 
 ```python
-from pathlib import Path
-
 from railway_sdk import fn
 
 hook = fn(
     "hook",
-    Path("hook.ts").read_text(),
+    code_file="functions/hook.ts",
     env={"DATABASE_URL": db.env.DATABASE_URL},
     domains=["hook.example.com"],
 )
-cron = fn("nightly", code="...", deploy={"cronSchedule": "0 3 * * *"})
+cron = fn("nightly", code_file="functions/nightly.ts", deploy={"cronSchedule": "0 3 * * *"})
 ```
 
-`runtime` pins the image: `fn("hook", code, runtime="bun:1.2.16")`. The default
-is the current Bun runtime. Without `code`, `fn` is a plain service node tagged
-`kind: function` for config you manage elsewhere.
+`runtime` pins the image: `fn("hook", "hook.ts", runtime="bun:1.2.16")`. The
+default is the current Bun runtime. Without `code_file`, `fn` is a plain service
+node tagged `kind: function` for config you manage elsewhere.
 
 The CLI evaluates this file and diffs against the linked environment.
 Config as Code migration lives in the CLI (`railway config migrate --lang py`).

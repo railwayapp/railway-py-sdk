@@ -1,5 +1,6 @@
 """Replicate the CLI's python3 -c eval wrapper against this package."""
 
+import base64
 import json
 import subprocess
 import sys
@@ -22,7 +23,10 @@ print(json.dumps({"partial": partial, "project": project}, default=str))
 
 
 def test_cli_eval_wrapper_loads_sdk(tmp_path: Path):
-    source = tmp_path / "railway.py"
+    config_dir = tmp_path / ".railway"
+    config_dir.mkdir()
+    (config_dir / "hook.ts").write_text("export default { fetch: () => new Response('ok') };")
+    source = config_dir / "railway.py"
     source.write_text(
         textwrap.dedent(
             """
@@ -33,16 +37,19 @@ def test_cli_eval_wrapper_loads_sdk(tmp_path: Path):
             @define_railway
             def main(ctx=None):
                 web = service("api", start="echo api", tracing={"enabled": True, "autoInstrumentation": True})
-                hook = fn("hook", "export default { fetch: () => new Response('ok') };")
+                hook = fn("hook", code_file="hook.ts")
                 return project("app", resources=[web, hook])
             """
         )
     )
+    # Run from the project root, not the config directory: `code_file` must
+    # resolve against the config file, not the working directory.
     result = subprocess.run(
         [sys.executable, "-c", CLI_EVAL, str(source)],
         check=True,
         capture_output=True,
         text=True,
+        cwd=tmp_path,
     )
     payload = json.loads(result.stdout)
     assert payload["partial"] == "api"
@@ -52,4 +59,6 @@ def test_cli_eval_wrapper_loads_sdk(tmp_path: Path):
     assert resources[0]["tracing"] == {"enabled": True, "autoInstrumentation": True}
     assert resources[1]["kind"] == "function"
     assert resources[1]["source"]["image"].startswith("ghcr.io/railwayapp/function-bun:")
-    assert resources[1]["deploy"]["startCommand"].startswith("./run.sh ")
+    assert resources[1]["deploy"]["startCommand"] == "./run.sh " + base64.b64encode(
+        b"export default { fetch: () => new Response('ok') };"
+    ).decode("ascii")

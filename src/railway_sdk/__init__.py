@@ -11,6 +11,9 @@ from __future__ import annotations
 
 import base64
 import hashlib
+import inspect
+import os
+from pathlib import Path
 from typing import Any, Callable, Iterable, Mapping, Sequence
 
 __all__ = [
@@ -216,29 +219,65 @@ def function_start_command(code: str | bytes) -> str:
     return f"./run.sh {base64.b64encode(payload).decode('ascii')}"
 
 
-def fn(name: str, code: str | bytes | None = None, runtime: str | None = None, **config: Any) -> Service:
+def fn(
+    name: str,
+    code_file: str | os.PathLike[str] | None = None,
+    runtime: str | None = None,
+    **config: Any,
+) -> Service:
     """A Railway Function: a single file of code run by the function image.
 
-    ``code`` is the file's source. It compiles to the runtime's image as the
-    service source plus a base64 start command, the same shape the dashboard
-    editor and ``railway functions push`` write. ``runtime`` picks the image
-    (see :func:`function_image`); the default is Bun.
+    ``code_file`` is the path of that file, relative to the config file that
+    calls ``fn`` (absolute paths are used as-is). The SDK reads it when the
+    config is evaluated and compiles it to the runtime's image as the service
+    source plus a base64 start command, the same shape the dashboard editor and
+    ``railway functions push`` write. ``runtime`` picks the image (see
+    :func:`function_image`); the default is Bun.
 
-    Without ``code`` this is a plain service node tagged ``kind: function``.
+    Without ``code_file`` this is a plain service node tagged ``kind: function``.
     """
     config = dict(config)
-    if code is not None:
+    if code_file is not None:
         if config.get("source") is not None:
-            raise ValueError("fn() takes either `code` or `source`, not both.")
+            raise ValueError("fn() takes either `code_file` or `source`, not both.")
         if _has_start_command(config):
-            raise ValueError("fn() derives the start command from `code`; do not pass `start` as well.")
+            raise ValueError("fn() derives the start command from `code_file`; do not pass `start` as well.")
         config["source"] = image(function_image(runtime))
-        config["start"] = function_start_command(code)
+        config["start"] = function_start_command(_read_code_file(name, code_file))
     elif runtime is not None:
         if config.get("source") is not None:
             raise ValueError("fn() takes either `runtime` or `source`, not both.")
         config["source"] = image(function_image(runtime))
     return Service({**_service_node(name, config), "kind": "function"})
+
+
+def _read_code_file(name: str, code_file: str | os.PathLike[str]) -> bytes:
+    path = Path(code_file).expanduser()
+    if not path.is_absolute():
+        path = _config_directory() / path
+    try:
+        return path.read_bytes()
+    except FileNotFoundError:
+        raise FileNotFoundError(
+            f"fn({name!r}): code_file {os.fspath(code_file)!r} not found at {path}. "
+            "Relative paths resolve against the config file that calls fn()."
+        ) from None
+
+
+def _config_directory() -> Path:
+    """Directory of the user's config module, found as the nearest caller
+    outside this package. Falls back to the working directory (REPL, ``-c``)."""
+    here = Path(__file__).resolve()
+    frame = inspect.currentframe()
+    try:
+        while frame is not None:
+            file = frame.f_globals.get("__file__")
+            if file and Path(file).resolve() != here:
+                return Path(file).resolve().parent
+            frame = frame.f_back
+    finally:
+        del frame
+    return Path.cwd()
 
 
 def _has_start_command(config: Mapping[str, Any]) -> bool:
