@@ -26,8 +26,9 @@ Functions are single-file services run by Railway's function image. Point
 when the config is evaluated, compiling it to the image plus the base64 start
 command that the dashboard editor and `railway functions push` write — the same
 thing you would get by hand with `source=image(...)` and
-`start="./run.sh <base64>"`. Source is capped at 96 KB, checked at authoring
-time.
+`start="./run.sh <base64>"`. Source is capped at `FUNCTION_SOURCE_MAX_BYTES`
+(98295 bytes, just under 96 KB: the whole start command has to fit one argv
+entry), checked at authoring time before any plan.
 
 ```python
 from railway_sdk import fn
@@ -42,8 +43,12 @@ cron = fn("nightly", code_file="functions/nightly.ts", deploy={"cronSchedule": "
 ```
 
 `runtime` pins the image: `fn("hook", "hook.ts", runtime="bun:1.2.16")`. The
-default is the current Bun runtime. Without `code_file`, `fn` is a plain service
-node tagged `kind: function` for config you manage elsewhere.
+default is the current Bun runtime (`FUNCTION_IMAGES["bun"]`), and an explicit
+`source=image(...)` wins over `runtime`. The pieces are exported on their own
+too: `function_image(runtime)` resolves a runtime to its image and
+`function_start_command(code)` encodes source into the start command. Without
+`code_file`, `fn` is a plain service node tagged `kind: function` for config
+you manage elsewhere.
 
 The CLI evaluates this file and diffs against the linked environment.
 Config as Code migration lives in the CLI (`railway config migrate --lang py`).

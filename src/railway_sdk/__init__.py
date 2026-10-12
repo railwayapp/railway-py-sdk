@@ -167,13 +167,18 @@ def service(name: str, **config: Any) -> Service:
 
 FUNCTION_IMAGE_PREFIX = "ghcr.io/railwayapp/function-"
 
-# Runtime name -> pinned image. Mirrors `FUNCTION_IMAGES` in `@railway/models`.
+# Runtime name -> pinned image, the same pin the dashboard and
+# `railway functions push` use. Pinned so a function plans the same on every
+# machine; pass `runtime="bun:<version>"` or `source=image(...)` for another tag.
 FUNCTION_IMAGES: Mapping[str, str] = {"bun": f"{FUNCTION_IMAGE_PREFIX}bun:1.4.0"}
 
-# The source rides base64-encoded inside a single argv entry of the start
-# command, and the kernel caps one argument at 128 KiB, so the decoded source
-# tops out at 96 KB. The dashboard, the CLI and the API enforce the same limit.
-FUNCTION_SOURCE_MAX_BYTES = 96 * 1024
+_FUNCTION_RUN_PREFIX = "./run.sh "
+
+# Largest function source `fn()` accepts, in UTF-8 bytes. The base64 payload is
+# one argv entry of the container's start command and the kernel caps a single
+# argument at 128 KiB (including the terminating NUL), so the decoded source
+# tops out just under 96 KB. The API enforces the same number.
+FUNCTION_SOURCE_MAX_BYTES = (128 * 1024 - 1 - len(_FUNCTION_RUN_PREFIX)) // 4 * 3
 
 
 def function_image(runtime: str | None = None) -> str:
@@ -192,7 +197,10 @@ def function_image(runtime: str | None = None) -> str:
         return runtime
     if runtime in FUNCTION_IMAGES:
         return FUNCTION_IMAGES[runtime]
-    if runtime.split(":", 1)[0] in FUNCTION_IMAGES:
+    base, _, version = runtime.partition(":")
+    if base in FUNCTION_IMAGES:
+        if not version:
+            raise ValueError(f"Function runtime {runtime!r} has an empty version; use {base!r} or {base}:<version>.")
         return f"{FUNCTION_IMAGE_PREFIX}{runtime}"
     known = ", ".join(sorted(FUNCTION_IMAGES))
     raise ValueError(f"Unknown function runtime {runtime!r}. Known runtimes: {known}.")
@@ -212,11 +220,10 @@ def function_start_command(code: str | bytes) -> str:
     else:
         raise ValueError(f"code must be a string, got {type(code).__name__}.")
     if len(payload) > FUNCTION_SOURCE_MAX_BYTES:
-        kb = -(-len(payload) // 1024)
         raise ValueError(
-            f"Function source code is {kb} KB; the limit is {FUNCTION_SOURCE_MAX_BYTES // 1024} KB."
+            f"Function source code is {len(payload)} bytes; the limit is {FUNCTION_SOURCE_MAX_BYTES} bytes."
         )
-    return f"./run.sh {base64.b64encode(payload).decode('ascii')}"
+    return _FUNCTION_RUN_PREFIX + base64.b64encode(payload).decode("ascii")
 
 
 def fn(
@@ -232,21 +239,21 @@ def fn(
     config is evaluated and compiles it to the runtime's image as the service
     source plus a base64 start command, the same shape the dashboard editor and
     ``railway functions push`` write. ``runtime`` picks the image (see
-    :func:`function_image`); the default is Bun.
+    :func:`function_image`); the default is Bun. An explicit ``source`` wins
+    over the runtime image, so ``source=image(...)`` is another way to pin a tag.
 
     Without ``code_file`` this is a plain service node tagged ``kind: function``.
     """
     config = dict(config)
+    if runtime is not None and config.get("source") is not None:
+        raise ValueError("fn() takes either `runtime` or `source`, not both.")
     if code_file is not None:
-        if config.get("source") is not None:
-            raise ValueError("fn() takes either `code_file` or `source`, not both.")
         if _has_start_command(config):
             raise ValueError("fn() derives the start command from `code_file`; do not pass `start` as well.")
-        config["source"] = image(function_image(runtime))
+        if config.get("source") is None:
+            config["source"] = image(function_image(runtime))
         config["start"] = function_start_command(_read_code_file(name, code_file))
     elif runtime is not None:
-        if config.get("source") is not None:
-            raise ValueError("fn() takes either `runtime` or `source`, not both.")
         config["source"] = image(function_image(runtime))
     return Service({**_service_node(name, config), "kind": "function"})
 

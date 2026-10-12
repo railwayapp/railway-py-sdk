@@ -9,7 +9,6 @@ from railway_sdk import (
     fn,
     function_image,
     function_start_command,
-    github,
     image,
     postgres,
 )
@@ -88,35 +87,50 @@ def test_fn_runtime_selection():
     assert no_code["source"]["image"] == FUNCTION_IMAGES["bun"]
     assert no_code["deploy"]["startCommand"] == "./run.sh abc"
 
+    # An explicit source wins over the runtime image, as in the TypeScript SDK.
+    pinned_source = fn("hook", FIXTURE, source=image("ghcr.io/railwayapp/function-bun:1.3.0")).to_graph()
+    assert pinned_source["source"] == {"type": "image", "image": "ghcr.io/railwayapp/function-bun:1.3.0"}
+    assert _decode(pinned_source["deploy"]["startCommand"]) == CODE
+
     with pytest.raises(ValueError, match="Unknown function runtime 'deno'"):
         function_image("deno")
     with pytest.raises(ValueError, match="non-empty string"):
         function_image("  ")
+    with pytest.raises(ValueError, match="empty version"):
+        function_image("bun:")
 
 
-def test_fn_enforces_96kb_source_limit(tmp_path: Path):
-    assert FUNCTION_SOURCE_MAX_BYTES == 96 * 1024
+def test_fn_enforces_source_limit(tmp_path: Path):
+    # The whole start command must fit one 128 KiB argv entry (NUL included).
+    assert FUNCTION_SOURCE_MAX_BYTES == 98295
+    assert FUNCTION_SOURCE_MAX_BYTES < 96 * 1024
 
     at_limit = tmp_path / "at_limit.ts"
     at_limit.write_bytes(b"x" * FUNCTION_SOURCE_MAX_BYTES)
-    assert len(_decode(fn("big", at_limit).to_graph()["deploy"]["startCommand"])) == FUNCTION_SOURCE_MAX_BYTES
+    start_command = fn("big", at_limit).to_graph()["deploy"]["startCommand"]
+    assert len(_decode(start_command)) == FUNCTION_SOURCE_MAX_BYTES
+    assert len(start_command.encode("ascii")) + 1 <= 128 * 1024
 
     over = tmp_path / "over.ts"
     over.write_bytes(b"x" * (FUNCTION_SOURCE_MAX_BYTES + 1))
-    with pytest.raises(ValueError, match="Function source code is 97 KB; the limit is 96 KB"):
+    with pytest.raises(ValueError, match="Function source code is 98296 bytes; the limit is 98295 bytes"):
         fn("big", over)
+
+    # 96 KB exactly used to pass here and then fail at apply.
+    ninety_six = tmp_path / "96k.ts"
+    ninety_six.write_bytes(b"x" * (96 * 1024))
+    with pytest.raises(ValueError, match="Function source code is 98304 bytes; the limit is 98295 bytes"):
+        fn("big", ninety_six)
 
     # The limit is on encoded UTF-8 bytes, not characters.
     multibyte = "🚂" * (FUNCTION_SOURCE_MAX_BYTES // 4 + 1)
-    with pytest.raises(ValueError, match="the limit is 96 KB"):
+    with pytest.raises(ValueError, match="the limit is 98295 bytes"):
         function_start_command(multibyte)
 
 
 def test_fn_rejects_conflicting_config():
-    with pytest.raises(ValueError, match="either `code_file` or `source`"):
-        fn("hook", FIXTURE, source=github("org/app"))
-    with pytest.raises(ValueError, match="either `code_file` or `source`"):
-        fn("hook", FIXTURE, source=image("nginx:latest"))
+    with pytest.raises(ValueError, match="either `runtime` or `source`"):
+        fn("hook", FIXTURE, runtime="bun", source=image("ghcr.io/railwayapp/function-bun:1.3.0"))
     with pytest.raises(ValueError, match="do not pass `start`"):
         fn("hook", FIXTURE, start="./other")
     with pytest.raises(ValueError, match="do not pass `start`"):
