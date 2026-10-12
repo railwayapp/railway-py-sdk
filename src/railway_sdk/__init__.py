@@ -10,10 +10,12 @@ Prefer one file that owns the whole environment. Set module-level
 from __future__ import annotations
 
 import hashlib
+from dataclasses import dataclass
 from typing import Any, Callable, Iterable, Mapping, Sequence
 
 __all__ = [
     "Project",
+    "ScheduleWindow",
     "Service",
     "bucket",
     "createRailwayContext",
@@ -67,6 +69,34 @@ class Service:
 
     def with_fields(self, **fields: Any) -> Service:
         return Service({**self._node, **fields})
+
+
+@dataclass(frozen=True)
+class ScheduleWindow:
+    """One weekly UTC maintenance window for image auto updates.
+
+    ``day`` is the UTC weekday, 0 (Sunday) through 6 (Saturday). The window
+    opens at ``start_hour`` (0-23, inclusive) and closes at ``end_hour`` (1-24,
+    exclusive), so ``ScheduleWindow(6, 2, 6)`` is Saturday 02:00-06:00 UTC and
+    ``ScheduleWindow(0, 0, 24)`` is all of Sunday. Serialises to the
+    ``{"day", "startHour", "endHour"}`` shape Railway's config expects.
+    """
+
+    day: int
+    start_hour: int
+    end_hour: int
+
+    def __post_init__(self) -> None:
+        _check_int(self.day, "day", 0, 6)
+        _check_int(self.start_hour, "start_hour", 0, 23)
+        _check_int(self.end_hour, "end_hour", 1, 24)
+        if self.end_hour <= self.start_hour:
+            raise ValueError(
+                f"ScheduleWindow end_hour ({self.end_hour}) must be after start_hour ({self.start_hour})."
+            )
+
+    def to_graph(self) -> dict[str, int]:
+        return {"day": self.day, "startHour": self.start_hour, "endHour": self.end_hour}
 
 
 class Project:
@@ -134,15 +164,29 @@ def project(name: str, definition: Mapping[str, Any] | None = None, **kwargs: An
 
 
 def github(repo: str, **options: Any) -> dict[str, Any]:
-    if options.get("autoUpdates") is not None:
+    if options.get("autoUpdates") is not None or options.get("auto_updates") is not None:
         raise ValueError("Image auto updates are only supported for Docker image sources.")
     return _prune({"type": "github", "repo": repo, "branch": options.pop("branch", "main"), **options})
 
 
 def image(image_name: str, **options: Any) -> dict[str, Any]:
-    if options.get("autoUpdates") is not None and not _supports_image_auto_updates(image_name):
+    """A Docker image source.
+
+    ``autoUpdates`` (or ``auto_updates``) opts the service into image auto
+    updates: ``{"type": "patch" | "minor" | "disabled", "schedule": [...],
+    "tagMode": "semver" | "sha"}``. ``schedule`` is a list of
+    :class:`ScheduleWindow` (or equivalent ``{"day", "startHour", "endHour"}``
+    mappings) naming the weekly UTC windows updates may run in. Only Docker Hub
+    and GHCR images support auto updates.
+    """
+    auto_updates = options.pop("autoUpdates", None)
+    if auto_updates is None:
+        auto_updates = options.pop("auto_updates", None)
+    else:
+        options.pop("auto_updates", None)
+    if auto_updates is not None and not _supports_image_auto_updates(image_name):
         raise ValueError("Image auto updates are only supported for Docker Hub and GHCR images.")
-    return _prune({"type": "image", "image": image_name, **options})
+    return _prune({"type": "image", "image": image_name, "autoUpdates": _normalize_auto_updates(auto_updates), **options})
 
 
 def template(template_name: str, **options: Any) -> dict[str, Any]:
@@ -460,6 +504,81 @@ def _normalize_volume_mounts(volume_mounts: Mapping[str, Any] | None) -> dict[st
             continue
         raw_mounts[key] = value
     return _prune({"volumeMounts": raw_mounts, "volumeAttachments": attachments}) or {}
+
+
+_AUTO_UPDATES_TYPES = ("disabled", "patch", "minor")
+_AUTO_UPDATES_TAG_MODES = ("semver", "sha")
+_AUTO_UPDATES_FIELDS = ("type", "schedule", "tagMode")
+_SCHEDULE_WINDOW_KEYS = ("day", "startHour", "endHour")
+
+
+def _normalize_auto_updates(auto_updates: Any) -> dict[str, Any] | None:
+    """Railway's ``source.autoUpdates`` block, validated and camelCased."""
+    if auto_updates is None:
+        return None
+    if not isinstance(auto_updates, Mapping):
+        raise ValueError("autoUpdates must be a mapping with `type`, `schedule` and/or `tagMode`.")
+    unknown = sorted(str(key) for key in auto_updates if key not in _AUTO_UPDATES_FIELDS)
+    if unknown:
+        raise ValueError(
+            f"Unknown autoUpdates field(s): {', '.join(unknown)}. Allowed: {', '.join(_AUTO_UPDATES_FIELDS)}."
+        )
+    out: dict[str, Any] = {}
+    update_type = auto_updates.get("type")
+    if update_type is not None:
+        if update_type not in _AUTO_UPDATES_TYPES:
+            raise ValueError(
+                f"autoUpdates.type must be one of {', '.join(_AUTO_UPDATES_TYPES)}, got {update_type!r}."
+            )
+        out["type"] = update_type
+    tag_mode = auto_updates.get("tagMode")
+    if tag_mode is not None:
+        if tag_mode not in _AUTO_UPDATES_TAG_MODES:
+            raise ValueError(
+                f"autoUpdates.tagMode must be one of {', '.join(_AUTO_UPDATES_TAG_MODES)}, got {tag_mode!r}."
+            )
+        out["tagMode"] = tag_mode
+    schedule = auto_updates.get("schedule")
+    if schedule is not None:
+        out["schedule"] = _normalize_schedule(schedule)
+    return _prune(out)
+
+
+def _normalize_schedule(schedule: Any) -> list[dict[str, int]]:
+    if isinstance(schedule, (str, bytes, Mapping)) or not isinstance(schedule, Iterable):
+        raise ValueError("autoUpdates.schedule must be a list of ScheduleWindow entries.")
+    windows = [_normalize_schedule_window(window) for window in schedule]
+    if not windows:
+        # An empty schedule stands auto updates down without saying so; use
+        # type="disabled" for that.
+        raise ValueError("autoUpdates.schedule needs at least one window; use type=\"disabled\" to turn updates off.")
+    return windows
+
+
+def _normalize_schedule_window(window: Any) -> dict[str, int]:
+    if isinstance(window, ScheduleWindow):
+        return window.to_graph()
+    if not isinstance(window, Mapping):
+        raise ValueError(
+            f"autoUpdates.schedule entries must be ScheduleWindow or a day/startHour/endHour mapping, got {type(window).__name__}."
+        )
+    unknown = sorted(str(key) for key in window if key not in _SCHEDULE_WINDOW_KEYS)
+    missing = [key for key in _SCHEDULE_WINDOW_KEYS if key not in window]
+    if unknown or missing:
+        raise ValueError(
+            "autoUpdates.schedule entries take exactly day, startHour and endHour"
+            + (f"; unknown: {', '.join(unknown)}" if unknown else "")
+            + (f"; missing: {', '.join(missing)}" if missing else "")
+            + "."
+        )
+    return ScheduleWindow(window["day"], window["startHour"], window["endHour"]).to_graph()
+
+
+def _check_int(value: Any, name: str, low: int, high: int) -> None:
+    if isinstance(value, bool) or not isinstance(value, int):
+        raise ValueError(f"ScheduleWindow {name} must be an integer, got {type(value).__name__}.")
+    if not low <= value <= high:
+        raise ValueError(f"ScheduleWindow {name} must be between {low} and {high}, got {value}.")
 
 
 def _supports_image_auto_updates(image_name: str) -> bool:
