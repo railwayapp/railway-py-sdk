@@ -9,10 +9,13 @@ Prefer one file that owns the whole environment. Set module-level
 
 from __future__ import annotations
 
+import base64
 import hashlib
 from typing import Any, Callable, Iterable, Mapping, Sequence
 
 __all__ = [
+    "FUNCTION_IMAGES",
+    "FUNCTION_SOURCE_MAX_BYTES",
     "Project",
     "Service",
     "bucket",
@@ -23,6 +26,8 @@ __all__ = [
     "define_railway",
     "empty",
     "fn",
+    "function_image",
+    "function_start_command",
     "github",
     "group",
     "image",
@@ -157,8 +162,91 @@ def service(name: str, **config: Any) -> Service:
     return Service(_service_node(name, config))
 
 
-def fn(name: str, **config: Any) -> Service:
+FUNCTION_IMAGE_PREFIX = "ghcr.io/railwayapp/function-"
+
+# Runtime name -> pinned image. Mirrors `FUNCTION_IMAGES` in `@railway/models`.
+FUNCTION_IMAGES: Mapping[str, str] = {"bun": f"{FUNCTION_IMAGE_PREFIX}bun:1.4.0"}
+
+# The source rides base64-encoded inside a single argv entry of the start
+# command, and the kernel caps one argument at 128 KiB, so the decoded source
+# tops out at 96 KB. The dashboard, the CLI and the API enforce the same limit.
+FUNCTION_SOURCE_MAX_BYTES = 96 * 1024
+
+
+def function_image(runtime: str | None = None) -> str:
+    """Resolve a function runtime to its image.
+
+    ``runtime`` is a runtime name (``"bun"``), a runtime with a version
+    (``"bun:1.2.16"``) or a full ``ghcr.io/railwayapp/function-*`` image.
+    ``None`` picks the default Bun runtime.
+    """
+    if runtime is None:
+        return FUNCTION_IMAGES["bun"]
+    if not isinstance(runtime, str) or not runtime.strip():
+        raise ValueError("runtime must be a non-empty string.")
+    runtime = runtime.strip()
+    if runtime.lower().startswith(FUNCTION_IMAGE_PREFIX):
+        return runtime
+    if runtime in FUNCTION_IMAGES:
+        return FUNCTION_IMAGES[runtime]
+    if runtime.split(":", 1)[0] in FUNCTION_IMAGES:
+        return f"{FUNCTION_IMAGE_PREFIX}{runtime}"
+    known = ", ".join(sorted(FUNCTION_IMAGES))
+    raise ValueError(f"Unknown function runtime {runtime!r}. Known runtimes: {known}.")
+
+
+def function_start_command(code: str | bytes) -> str:
+    """The ``./run.sh <base64>`` start command carrying a function's source.
+
+    The function image's ``run.sh`` decodes the argument back into a single
+    file and runs it. Raises ``ValueError`` when the source is over
+    ``FUNCTION_SOURCE_MAX_BYTES``.
+    """
+    if isinstance(code, str):
+        payload = code.encode("utf-8")
+    elif isinstance(code, (bytes, bytearray)):
+        payload = bytes(code)
+    else:
+        raise ValueError(f"code must be a string, got {type(code).__name__}.")
+    if len(payload) > FUNCTION_SOURCE_MAX_BYTES:
+        kb = -(-len(payload) // 1024)
+        raise ValueError(
+            f"Function source code is {kb} KB; the limit is {FUNCTION_SOURCE_MAX_BYTES // 1024} KB."
+        )
+    return f"./run.sh {base64.b64encode(payload).decode('ascii')}"
+
+
+def fn(name: str, code: str | bytes | None = None, runtime: str | None = None, **config: Any) -> Service:
+    """A Railway Function: a single file of code run by the function image.
+
+    ``code`` is the file's source. It compiles to the runtime's image as the
+    service source plus a base64 start command, the same shape the dashboard
+    editor and ``railway functions push`` write. ``runtime`` picks the image
+    (see :func:`function_image`); the default is Bun.
+
+    Without ``code`` this is a plain service node tagged ``kind: function``.
+    """
+    config = dict(config)
+    if code is not None:
+        if config.get("source") is not None:
+            raise ValueError("fn() takes either `code` or `source`, not both.")
+        if _has_start_command(config):
+            raise ValueError("fn() derives the start command from `code`; do not pass `start` as well.")
+        config["source"] = image(function_image(runtime))
+        config["start"] = function_start_command(code)
+    elif runtime is not None:
+        if config.get("source") is not None:
+            raise ValueError("fn() takes either `runtime` or `source`, not both.")
+        config["source"] = image(function_image(runtime))
     return Service({**_service_node(name, config), "kind": "function"})
+
+
+def _has_start_command(config: Mapping[str, Any]) -> bool:
+    if config.get("start") or config.get("startCommand"):
+        return True
+    if (config.get("run") or {}).get("command"):
+        return True
+    return bool((config.get("deploy") or {}).get("startCommand"))
 
 
 def postgres(name: str, **config: Any) -> Service:

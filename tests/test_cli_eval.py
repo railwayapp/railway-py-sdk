@@ -26,14 +26,15 @@ def test_cli_eval_wrapper_loads_sdk(tmp_path: Path):
     source.write_text(
         textwrap.dedent(
             """
-            from railway_sdk import define_railway, project, service
+            from railway_sdk import define_railway, fn, project, service
 
             PARTIAL = "api"
 
             @define_railway
             def main(ctx=None):
                 web = service("api", start="echo api", tracing={"enabled": True, "autoInstrumentation": True})
-                return project("app", resources=[web])
+                hook = fn("hook", "export default { fetch: () => new Response('ok') };")
+                return project("app", resources=[web, hook])
             """
         )
     )
@@ -49,3 +50,6 @@ def test_cli_eval_wrapper_loads_sdk(tmp_path: Path):
     assert resources[0]["address"] == "service.api"
     assert resources[0]["deploy"]["startCommand"] == "echo api"
     assert resources[0]["tracing"] == {"enabled": True, "autoInstrumentation": True}
+    assert resources[1]["kind"] == "function"
+    assert resources[1]["source"]["image"].startswith("ghcr.io/railwayapp/function-bun:")
+    assert resources[1]["deploy"]["startCommand"].startswith("./run.sh ")
