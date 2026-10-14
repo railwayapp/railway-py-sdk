@@ -36,7 +36,12 @@ def test_cli_eval_wrapper_loads_sdk(tmp_path: Path):
 
             @define_railway
             def main(ctx=None):
-                web = service("api", start="echo api", tracing={"enabled": True, "autoInstrumentation": True})
+                web = service(
+                    "api",
+                    start="echo api",
+                    tracing={"enabled": True, "autoInstrumentation": True},
+                    cdn={"enabled": True, "purgeOnDeploy": "all"},
+                )
                 hook = fn("hook", code_file="hook.ts")
                 return project("app", resources=[web, hook])
             """
@@ -57,6 +62,7 @@ def test_cli_eval_wrapper_loads_sdk(tmp_path: Path):
     assert resources[0]["address"] == "service.api"
     assert resources[0]["deploy"]["startCommand"] == "echo api"
     assert resources[0]["tracing"] == {"enabled": True, "autoInstrumentation": True}
+    assert resources[0]["cdn"] == {"enabled": True, "purgeOnDeploy": "all"}
     assert resources[1]["kind"] == "function"
     assert resources[1]["source"]["image"].startswith("ghcr.io/railwayapp/function-bun:")
     assert resources[1]["deploy"]["startCommand"] == "./run.sh " + base64.b64encode(

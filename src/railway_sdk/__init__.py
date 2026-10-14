@@ -23,6 +23,7 @@ __all__ = [
     "Project",
     "ScheduleWindow",
     "Service",
+    "ServiceCdn",
     "bucket",
     "createRailwayContext",
     "create_railway_context",
@@ -105,6 +106,54 @@ class ScheduleWindow:
 
     def to_graph(self) -> dict[str, int]:
         return {"day": self.day, "startHour": self.start_hour, "endHour": self.end_hour}
+
+
+_CDN_HTML_CACHING = ("auto", "force", "never")
+_CDN_PURGE_ON_DEPLOY = ("off", "html", "all")
+_CDN_FIELDS = ("enabled", "defaultTtlSeconds", "htmlCaching", "staleWhileRevalidate", "purgeOnDeploy")
+
+
+@dataclass(frozen=True)
+class ServiceCdn:
+    """CDN caching for a service's public domains, Railway's ``services[id].cdn``.
+
+    Settings live on the edge and apply without a deploy. Railway serialises
+    the block only while caching is on, and only the knobs that differ from
+    the defaults, so ``ServiceCdn(enabled=True)`` is a service caching with the
+    defaults and an omitted block, ``enabled=False`` and ``None`` all mean off.
+    Serialises to the camelCase shape Railway's config expects.
+
+    ``enabled`` needs a public domain and cannot be combined with Railway
+    Authentication. ``default_ttl_seconds`` is how long the edge keeps a
+    cacheable response without ``Cache-Control`` headers of its own (default
+    7200). ``html_caching`` is ``"auto"`` (follow the response headers),
+    ``"force"`` or ``"never"`` (default ``"auto"``). ``stale_while_revalidate``
+    honours ``stale-while-revalidate`` directives (default ``True``).
+    ``purge_on_deploy`` is what a successful deploy purges: ``"html"`` keeps
+    immutable assets warm, ``"all"`` clears everything, ``"off"`` purges
+    nothing (default ``"html"``).
+    """
+
+    enabled: bool | None = None
+    default_ttl_seconds: int | None = None
+    html_caching: str | None = None
+    stale_while_revalidate: bool | None = None
+    purge_on_deploy: str | None = None
+
+    def __post_init__(self) -> None:
+        _check_cdn_fields(self._raw())
+
+    def _raw(self) -> dict[str, Any]:
+        return {
+            "enabled": self.enabled,
+            "defaultTtlSeconds": self.default_ttl_seconds,
+            "htmlCaching": self.html_caching,
+            "staleWhileRevalidate": self.stale_while_revalidate,
+            "purgeOnDeploy": self.purge_on_deploy,
+        }
+
+    def to_graph(self) -> dict[str, Any] | None:
+        return _prune(self._raw())
 
 
 class Project:
@@ -481,6 +530,9 @@ def _service_node(name: str, config: Mapping[str, Any]) -> dict[str, Any]:
     tracing = _normalize_tracing(config.get("tracing"))
     if tracing is not None:
         node["tracing"] = tracing
+    cdn = _normalize_cdn(config.get("cdn"))
+    if cdn is not None:
+        node["cdn"] = cdn
     variables = config.get("env") or config.get("variables")
     if variables:
         merged = {**(config.get("variables") or {}), **(config.get("env") or {})}
@@ -606,6 +658,47 @@ def _normalize_tracing(tracing: Any) -> dict[str, bool] | None:
         if value is not None and not isinstance(value, bool):
             raise ValueError(f"tracing.{key} must be a boolean, got {type(value).__name__}.")
     return _prune(dict(tracing))
+
+
+def _normalize_cdn(cdn: Any) -> dict[str, Any] | None:
+    """Per-environment CDN block, Railway's ``services[id].cdn``.
+
+    Accepts a :class:`ServiceCdn` or a camelCase mapping with the same keys.
+    Railway only serialises the knobs that differ from the defaults, so the
+    block passes through as written: ``None`` knobs are dropped and an empty
+    block is no block at all.
+    """
+    if cdn is None:
+        return None
+    if isinstance(cdn, ServiceCdn):
+        return cdn.to_graph()
+    if not isinstance(cdn, Mapping):
+        raise ValueError(
+            "cdn must be a ServiceCdn or a mapping with `enabled`, `defaultTtlSeconds`, `htmlCaching`, "
+            "`staleWhileRevalidate` and/or `purgeOnDeploy`."
+        )
+    unknown = sorted(str(key) for key in cdn if key not in _CDN_FIELDS)
+    if unknown:
+        raise ValueError(f"Unknown cdn field(s): {', '.join(unknown)}. Allowed: {', '.join(_CDN_FIELDS)}.")
+    _check_cdn_fields(cdn)
+    return _prune(dict(cdn))
+
+
+def _check_cdn_fields(cdn: Mapping[str, Any]) -> None:
+    for key in ("enabled", "staleWhileRevalidate"):
+        value = cdn.get(key)
+        if value is not None and not isinstance(value, bool):
+            raise ValueError(f"cdn.{key} must be a boolean, got {type(value).__name__}.")
+    ttl = cdn.get("defaultTtlSeconds")
+    if ttl is not None:
+        if isinstance(ttl, bool) or not isinstance(ttl, int):
+            raise ValueError(f"cdn.defaultTtlSeconds must be an integer, got {type(ttl).__name__}.")
+        if ttl < 0:
+            raise ValueError(f"cdn.defaultTtlSeconds must not be negative, got {ttl}.")
+    for key, allowed in (("htmlCaching", _CDN_HTML_CACHING), ("purgeOnDeploy", _CDN_PURGE_ON_DEPLOY)):
+        value = cdn.get(key)
+        if value is not None and value not in allowed:
+            raise ValueError(f"cdn.{key} must be one of {', '.join(allowed)}, got {value!r}.")
 
 
 def _normalize_variables(variables: Mapping[str, Any]) -> dict[str, Any]:

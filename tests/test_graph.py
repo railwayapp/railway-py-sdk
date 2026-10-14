@@ -2,6 +2,7 @@ import pytest
 
 from railway_sdk import (
     ScheduleWindow,
+    ServiceCdn,
     bucket,
     create_railway_context,
     define_railway,
@@ -113,6 +114,80 @@ def test_tracing_rejects_bad_input():
         service("web", tracing={"enabled": "yes"})
     with pytest.raises(ValueError, match="tracing must be a mapping"):
         service("web", tracing=True)
+
+
+_FULL_CDN = {
+    "enabled": True,
+    "defaultTtlSeconds": 86400,
+    "htmlCaching": "force",
+    "staleWhileRevalidate": False,
+    "purgeOnDeploy": "all",
+}
+
+
+def test_cdn_block_passes_through():
+    # The CLI compiles `cdn` into `services[id].cdn` and backboard serialises
+    # only the knobs that differ from the defaults, so the SDK passes the
+    # block through verbatim rather than filling defaults in.
+    assert service("web", start="./app", cdn=_FULL_CDN).to_graph()["cdn"] == _FULL_CDN
+    assert service("web", start="./app", cdn={"enabled": True}).to_graph()["cdn"] == {"enabled": True}
+
+    # Off is authored as-is; the CLI treats it the same as absent.
+    assert service("web", start="./app", cdn={"enabled": False}).to_graph()["cdn"] == {"enabled": False}
+
+    worker = fn("worker", start="./worker", cdn={"enabled": True}).to_graph()
+    assert worker["cdn"] == {"enabled": True}
+    assert worker["kind"] == "function"
+
+
+def test_cdn_dataclass_matches_mapping_form():
+    typed = ServiceCdn(
+        enabled=True,
+        default_ttl_seconds=86400,
+        html_caching="force",
+        stale_while_revalidate=False,
+        purge_on_deploy="all",
+    )
+    assert typed.to_graph() == _FULL_CDN
+    assert service("web", cdn=typed).to_graph()["cdn"] == _FULL_CDN
+    assert service("web", cdn=ServiceCdn(enabled=True)).to_graph()["cdn"] == {"enabled": True}
+    assert "cdn" not in service("web", cdn=ServiceCdn()).to_graph()
+
+
+def test_cdn_none_knobs_are_pruned():
+    node = service("web", start="./app", cdn={"enabled": True, "defaultTtlSeconds": None}).to_graph()
+    assert node["cdn"] == {"enabled": True}
+
+    assert "cdn" not in service("web", start="./app", cdn={"enabled": None}).to_graph()
+    assert "cdn" not in service("web", start="./app", cdn={}).to_graph()
+    assert "cdn" not in service("web", start="./app", cdn=None).to_graph()
+    assert "cdn" not in service("web", start="./app").to_graph()
+
+
+def test_cdn_rejects_bad_input():
+    with pytest.raises(ValueError, match="Unknown cdn field"):
+        service("web", cdn={"enabled": True, "ttl": 60})
+    with pytest.raises(ValueError, match="cdn.enabled must be a boolean"):
+        service("web", cdn={"enabled": "yes"})
+    with pytest.raises(ValueError, match="cdn.staleWhileRevalidate must be a boolean"):
+        service("web", cdn={"staleWhileRevalidate": 1})
+    with pytest.raises(ValueError, match="cdn.htmlCaching must be one of auto, force, never"):
+        service("web", cdn={"htmlCaching": "always"})
+    with pytest.raises(ValueError, match="cdn.purgeOnDeploy must be one of off, html, all"):
+        service("web", cdn={"purgeOnDeploy": "none"})
+    with pytest.raises(ValueError, match="cdn.defaultTtlSeconds must be an integer"):
+        service("web", cdn={"defaultTtlSeconds": "3600"})
+    with pytest.raises(ValueError, match="cdn.defaultTtlSeconds must be an integer"):
+        service("web", cdn={"defaultTtlSeconds": True})
+    with pytest.raises(ValueError, match="cdn.defaultTtlSeconds must not be negative"):
+        service("web", cdn={"defaultTtlSeconds": -1})
+    with pytest.raises(ValueError, match="cdn must be a ServiceCdn or a mapping"):
+        service("web", cdn=True)
+    # The dataclass runs the same checks.
+    with pytest.raises(ValueError, match="cdn.htmlCaching must be one of"):
+        ServiceCdn(html_caching="always")
+    with pytest.raises(ValueError, match="cdn.defaultTtlSeconds must not be negative"):
+        ServiceCdn(default_ttl_seconds=-5)
 
 
 def test_ref_and_preserve():
