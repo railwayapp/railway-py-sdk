@@ -15,9 +15,14 @@ import inspect
 import os
 from dataclasses import dataclass
 from pathlib import Path
-from typing import Any, Callable, Iterable, Mapping, Sequence
+from typing import Any, Callable, Iterable, Literal, Mapping, Sequence, get_args
 
 __all__ = [
+    "EdgeRule",
+    "EdgeRuleAction",
+    "EdgeRuleExpr",
+    "EdgeRuleThen",
+    "EdgeRules",
     "FUNCTION_IMAGES",
     "FUNCTION_SOURCE_MAX_BYTES",
     "Project",
@@ -154,6 +159,103 @@ class ServiceCdn:
 
     def to_graph(self) -> dict[str, Any] | None:
         return _prune(self._raw())
+
+
+EdgeRuleAction = Literal["block", "allow", "challenge", "redirect", "cache_override"]
+"""What the edge does when a rule's condition matches."""
+
+_EDGE_RULE_ACTIONS: tuple[str, ...] = get_args(EdgeRuleAction)
+_EDGE_RULE_MODES = ("enforce",)
+_EDGE_RULE_FIELDS = ("description", "priority", "enabled", "mode", "if", "then")
+_EDGE_RULE_THEN_FIELDS = ("action", "params")
+_EDGE_RULE_CLAUSE_FIELDS = ("attr", "op", "value", "key")
+_EDGE_RULE_COMBINATORS = ("and", "or", "not")
+
+EdgeRuleExpr = Mapping[str, Any]
+"""A rule's condition: one clause over a request attribute, or a combinator.
+
+A clause is ``{"attr": ..., "op": ..., "value": ..., "key": ...}``. ``attr`` is
+``ipv4.src``, ``http.host``, ``http.path`` or ``http.header`` (with ``key``
+naming the header). ``op`` is ``eq``, ``neq``, ``in``, ``not_in``,
+``contains`` or ``matches`` (glob), as the attribute allows. ``value`` is a
+string, or a list of strings for ``in`` and ``not_in``. ``{"and": [...]}``,
+``{"or": [...]}`` and ``{"not": ...}`` combine clauses. Attributes and
+operators come from the edge's registry, which validates them when the change
+is committed.
+"""
+
+
+@dataclass(frozen=True)
+class EdgeRuleThen:
+    """What the edge does when a rule matches: an ``action`` and its ``params``.
+
+    ``params`` per action: ``status`` and ``body`` for ``block``; ``status``
+    and either ``location`` or ``host`` (plus ``preserve_path`` and
+    ``preserve_query``) for ``redirect``; ``ttl_seconds`` or ``bypass`` for
+    ``cache_override``. The SDK types ``params`` loosely; the edge validates
+    the whole ruleset when the change is committed.
+    """
+
+    action: str
+    params: Mapping[str, Any] | None = None
+
+    def __post_init__(self) -> None:
+        _check_edge_rule_then(self._raw(), "then")
+
+    def _raw(self) -> dict[str, Any]:
+        return {"action": self.action, "params": self.params}
+
+    def to_graph(self) -> dict[str, Any]:
+        return _edge_rule_then_to_graph(self._raw())
+
+
+@dataclass(frozen=True)
+class EdgeRule:
+    """One edge rule, an entry of Railway's ``services[id].edgeRules``.
+
+    ``priority`` is the evaluation order, lowest first, and must be unique
+    within the service. ``if_`` is the condition (see :data:`EdgeRuleExpr`),
+    serialised as ``if``. ``then`` is an :class:`EdgeRuleThen` or a mapping
+    with the same keys. ``description`` is free text, ``enabled=False`` keeps
+    a rule without evaluating it (default ``True``) and ``mode`` is
+    ``"enforce"``, the only mode today. Rules carry no id: the edge assigns
+    one, and a staged change keeps a live rule's id when the priority matches.
+    ``enabled`` and ``mode`` are omitted at their defaults.
+    """
+
+    priority: int
+    if_: EdgeRuleExpr
+    then: EdgeRuleThen | Mapping[str, Any]
+    description: str | None = None
+    enabled: bool | None = None
+    mode: str | None = None
+
+    def __post_init__(self) -> None:
+        _check_edge_rule(self._raw(), "edgeRules[?]")
+
+    def _raw(self) -> dict[str, Any]:
+        return {
+            "description": self.description,
+            "priority": self.priority,
+            "enabled": self.enabled,
+            "mode": self.mode,
+            "if": self.if_,
+            "then": self.then,
+        }
+
+    def to_graph(self) -> dict[str, Any]:
+        return _edge_rule_to_graph(self._raw())
+
+
+EdgeRules = Sequence["EdgeRule | Mapping[str, Any]"]
+"""The service's edge rules in this environment, Railway's ``services[id].edgeRules``.
+
+Evaluated at the edge before a request reaches the service, so they apply
+without a deploy. Railway serialises the list sorted by ``priority`` and
+without default-valued fields, so a reordered or default-laden copy does not
+plan as drift. An omitted key, ``[]`` and ``None`` all mean no rules; the list
+is replaced as a whole.
+"""
 
 
 class Project:
@@ -533,6 +635,9 @@ def _service_node(name: str, config: Mapping[str, Any]) -> dict[str, Any]:
     cdn = _normalize_cdn(config.get("cdn"))
     if cdn is not None:
         node["cdn"] = cdn
+    edge_rules = _normalize_edge_rules(config.get("edgeRules"))
+    if edge_rules is not None:
+        node["edgeRules"] = edge_rules
     variables = config.get("env") or config.get("variables")
     if variables:
         merged = {**(config.get("variables") or {}), **(config.get("env") or {})}
@@ -699,6 +804,165 @@ def _check_cdn_fields(cdn: Mapping[str, Any]) -> None:
         value = cdn.get(key)
         if value is not None and value not in allowed:
             raise ValueError(f"cdn.{key} must be one of {', '.join(allowed)}, got {value!r}.")
+
+
+def _normalize_edge_rules(rules: Any) -> list[dict[str, Any]] | None:
+    """Per-environment edge rules, Railway's ``services[id].edgeRules``.
+
+    Accepts a list of :class:`EdgeRule` or camelCase mappings with the same
+    keys. Backboard canonicalises the list (sorted by priority, defaults
+    dropped), so the SDK checks the shape and passes the rules through as
+    written. ``None`` means no key; ``[]`` is emitted as-is and means no rules.
+    """
+    if rules is None:
+        return None
+    if isinstance(rules, (str, bytes, Mapping)) or not isinstance(rules, Iterable):
+        raise ValueError("edgeRules must be a list of EdgeRule or mappings with `priority`, `if` and `then`.")
+    out: list[dict[str, Any]] = []
+    seen: dict[int, int] = {}
+    for index, rule in enumerate(rules):
+        label = f"edgeRules[{index}]"
+        if isinstance(rule, EdgeRule):
+            raw = rule._raw()
+        elif isinstance(rule, Mapping):
+            raw = dict(rule)
+        else:
+            raise ValueError(f"{label} must be an EdgeRule or a mapping, got {type(rule).__name__}.")
+        _check_edge_rule(raw, label)
+        priority = raw["priority"]
+        if priority in seen:
+            raise ValueError(
+                f"{label}.priority {priority} is already used by edgeRules[{seen[priority]}]; "
+                "priorities must be unique within a service."
+            )
+        seen[priority] = index
+        out.append(_edge_rule_to_graph(raw))
+    return out
+
+
+def _check_edge_rule(rule: Mapping[str, Any], label: str) -> None:
+    unknown = sorted(str(key) for key in rule if key not in _EDGE_RULE_FIELDS)
+    if unknown:
+        raise ValueError(
+            f"Unknown {label} field(s): {', '.join(unknown)}. Allowed: {', '.join(_EDGE_RULE_FIELDS)}."
+        )
+    priority = rule.get("priority")
+    if isinstance(priority, bool) or not isinstance(priority, int):
+        got = "missing" if priority is None else type(priority).__name__
+        raise ValueError(f"{label}.priority must be an integer, got {got}.")
+    description = rule.get("description")
+    if description is not None and not isinstance(description, str):
+        raise ValueError(f"{label}.description must be a string, got {type(description).__name__}.")
+    enabled = rule.get("enabled")
+    if enabled is not None and not isinstance(enabled, bool):
+        raise ValueError(f"{label}.enabled must be a boolean, got {type(enabled).__name__}.")
+    mode = rule.get("mode")
+    if mode is not None and mode not in _EDGE_RULE_MODES:
+        raise ValueError(f"{label}.mode must be one of {', '.join(_EDGE_RULE_MODES)}, got {mode!r}.")
+    if rule.get("if") is None:
+        raise ValueError(f"{label}.if is required.")
+    _check_edge_rule_expr(rule["if"], f"{label}.if")
+    if rule.get("then") is None:
+        raise ValueError(f"{label}.then is required.")
+    then = rule["then"]
+    _check_edge_rule_then(then._raw() if isinstance(then, EdgeRuleThen) else then, f"{label}.then")
+
+
+def _check_edge_rule_expr(expr: Any, label: str) -> None:
+    if not isinstance(expr, Mapping):
+        raise ValueError(
+            f"{label} must be a mapping: a clause or an and/or/not combinator, got {type(expr).__name__}."
+        )
+    combinators = [key for key in _EDGE_RULE_COMBINATORS if key in expr]
+    if combinators:
+        if len(combinators) > 1 or len(expr) > 1:
+            raise ValueError(
+                f"{label} must be exactly one of and, or, not, got {', '.join(sorted(map(str, expr)))}."
+            )
+        (key,) = combinators
+        if key == "not":
+            _check_edge_rule_expr(expr["not"], f"{label}.not")
+            return
+        children = expr[key]
+        if isinstance(children, (str, bytes, Mapping)) or not isinstance(children, Iterable):
+            raise ValueError(f"{label}.{key} must be a list of conditions, got {type(children).__name__}.")
+        for index, child in enumerate(children):
+            _check_edge_rule_expr(child, f"{label}.{key}[{index}]")
+        return
+    unknown = sorted(str(key) for key in expr if key not in _EDGE_RULE_CLAUSE_FIELDS)
+    if unknown:
+        raise ValueError(
+            f"Unknown {label} field(s): {', '.join(unknown)}. "
+            f"A clause has {', '.join(_EDGE_RULE_CLAUSE_FIELDS)}; combinators are {', '.join(_EDGE_RULE_COMBINATORS)}."
+        )
+    for key in ("attr", "op"):
+        value = expr.get(key)
+        if not isinstance(value, str) or not value:
+            raise ValueError(f"{label}.{key} must be a non-empty string.")
+    value = expr.get("value")
+    if isinstance(value, str):
+        pass
+    elif isinstance(value, (bytes, Mapping)) or not isinstance(value, Iterable):
+        raise ValueError(f"{label}.value must be a string or a list of strings, got {type(value).__name__}.")
+    elif not all(isinstance(item, str) for item in value):
+        raise ValueError(f"{label}.value must be a string or a list of strings.")
+    key = expr.get("key")
+    if key is not None and not isinstance(key, str):
+        raise ValueError(f"{label}.key must be a string, got {type(key).__name__}.")
+
+
+def _check_edge_rule_then(then: Any, label: str) -> None:
+    if not isinstance(then, Mapping):
+        raise ValueError(
+            f"{label} must be an EdgeRuleThen or a mapping with `action` and `params`, got {type(then).__name__}."
+        )
+    unknown = sorted(str(key) for key in then if key not in _EDGE_RULE_THEN_FIELDS)
+    if unknown:
+        raise ValueError(
+            f"Unknown {label} field(s): {', '.join(unknown)}. Allowed: {', '.join(_EDGE_RULE_THEN_FIELDS)}."
+        )
+    action = then.get("action")
+    if action not in _EDGE_RULE_ACTIONS:
+        raise ValueError(f"{label}.action must be one of {', '.join(_EDGE_RULE_ACTIONS)}, got {action!r}.")
+    params = then.get("params")
+    if params is not None and not isinstance(params, Mapping):
+        raise ValueError(f"{label}.params must be a mapping, got {type(params).__name__}.")
+
+
+def _edge_rule_to_graph(rule: Mapping[str, Any]) -> dict[str, Any]:
+    then = rule["then"]
+    return _prune(
+        {
+            "description": rule.get("description"),
+            "priority": rule["priority"],
+            "enabled": rule.get("enabled"),
+            "mode": rule.get("mode"),
+            "if": _edge_rule_expr_to_graph(rule["if"]),
+            "then": then.to_graph() if isinstance(then, EdgeRuleThen) else _edge_rule_then_to_graph(then),
+        }
+    )
+
+
+def _edge_rule_expr_to_graph(expr: Mapping[str, Any]) -> dict[str, Any]:
+    if "not" in expr:
+        return {"not": _edge_rule_expr_to_graph(expr["not"])}
+    for key in ("and", "or"):
+        if key in expr:
+            return {key: [_edge_rule_expr_to_graph(child) for child in expr[key]]}
+    value = expr["value"]
+    return _prune(
+        {
+            "attr": expr["attr"],
+            "op": expr["op"],
+            "value": value if isinstance(value, str) else list(value),
+            "key": expr.get("key"),
+        }
+    )
+
+
+def _edge_rule_then_to_graph(then: Mapping[str, Any]) -> dict[str, Any]:
+    params = then.get("params")
+    return _prune({"action": then["action"], "params": dict(params) if params is not None else None})
 
 
 def _normalize_variables(variables: Mapping[str, Any]) -> dict[str, Any]:
