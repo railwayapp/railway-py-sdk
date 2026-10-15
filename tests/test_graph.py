@@ -1,6 +1,8 @@
 import pytest
 
 from railway_sdk import (
+    EdgeRule,
+    EdgeRuleThen,
     ScheduleWindow,
     ServiceCdn,
     bucket,
@@ -188,6 +190,149 @@ def test_cdn_rejects_bad_input():
         ServiceCdn(html_caching="always")
     with pytest.raises(ValueError, match="cdn.defaultTtlSeconds must not be negative"):
         ServiceCdn(default_ttl_seconds=-5)
+
+
+_EDGE_RULES = [
+    {
+        "description": "block the scanner",
+        "priority": 10,
+        "enabled": False,
+        "mode": "enforce",
+        "if": {
+            "and": [
+                {"attr": "http.path", "op": "matches", "value": "/admin/*"},
+                {"not": {"attr": "ipv4.src", "op": "in", "value": ["10.0.0.0/8"]}},
+            ]
+        },
+        "then": {"action": "block", "params": {"status": 403}},
+    },
+    {
+        "priority": 0,
+        "if": {"attr": "http.header", "key": "x-canary", "op": "eq", "value": "1"},
+        "then": {"action": "cache_override", "params": {"bypass": True}},
+    },
+]
+
+
+def test_edge_rules_pass_through():
+    # The CLI compiles `edgeRules` into `services[id].edgeRules` and backboard
+    # canonicalises the list (sorted by priority, defaults dropped), so the
+    # SDK passes it through verbatim rather than normalising it.
+    assert service("web", start="./app", edgeRules=_EDGE_RULES).to_graph()["edgeRules"] == _EDGE_RULES
+    worker = fn("worker", start="./worker", edgeRules=_EDGE_RULES).to_graph()
+    assert worker["edgeRules"] == _EDGE_RULES
+    assert worker["kind"] == "function"
+
+    # Absent, `[]` and `None` all mean no rules; `[]` is kept as written.
+    assert service("web", start="./app", edgeRules=[]).to_graph()["edgeRules"] == []
+    assert "edgeRules" not in service("web", start="./app", edgeRules=None).to_graph()
+    assert "edgeRules" not in service("web", start="./app").to_graph()
+
+
+def test_edge_rule_dataclass_matches_mapping_form():
+    typed = [
+        EdgeRule(
+            description="block the scanner",
+            priority=10,
+            enabled=False,
+            mode="enforce",
+            if_=_EDGE_RULES[0]["if"],
+            then=EdgeRuleThen(action="block", params={"status": 403}),
+        ),
+        # `then` may be a mapping on a typed rule, and vice versa.
+        EdgeRule(0, _EDGE_RULES[1]["if"], {"action": "cache_override", "params": {"bypass": True}}),
+    ]
+    assert [rule.to_graph() for rule in typed] == _EDGE_RULES
+    assert service("web", edgeRules=typed).to_graph()["edgeRules"] == _EDGE_RULES
+    mixed = [typed[0], _EDGE_RULES[1]]
+    assert service("web", edgeRules=mixed).to_graph()["edgeRules"] == _EDGE_RULES
+    assert EdgeRuleThen("allow").to_graph() == {"action": "allow"}
+
+
+def test_edge_rules_none_fields_are_pruned():
+    rule = {
+        "description": None,
+        "priority": 5,
+        "enabled": None,
+        "mode": None,
+        "if": {"attr": "http.host", "op": "eq", "value": "old.example.com", "key": None},
+        "then": {"action": "redirect", "params": None},
+    }
+    assert service("web", edgeRules=[rule]).to_graph()["edgeRules"] == [
+        {
+            "priority": 5,
+            "if": {"attr": "http.host", "op": "eq", "value": "old.example.com"},
+            "then": {"action": "redirect"},
+        }
+    ]
+
+
+def test_edge_rules_reject_bad_input():
+    clause = {"attr": "http.path", "op": "eq", "value": "/"}
+    ok = {"priority": 1, "if": clause, "then": {"action": "allow"}}
+
+    with pytest.raises(ValueError, match="edgeRules must be a list"):
+        service("web", edgeRules=ok)
+    with pytest.raises(ValueError, match=r"edgeRules\[0\] must be an EdgeRule or a mapping"):
+        service("web", edgeRules=[True])
+    with pytest.raises(ValueError, match=r"Unknown edgeRules\[0\] field\(s\): id"):
+        service("web", edgeRules=[{**ok, "id": "abc"}])
+    with pytest.raises(ValueError, match=r"edgeRules\[0\].priority must be an integer, got missing"):
+        service("web", edgeRules=[{"if": clause, "then": {"action": "allow"}}])
+    with pytest.raises(ValueError, match=r"edgeRules\[0\].priority must be an integer, got bool"):
+        service("web", edgeRules=[{**ok, "priority": True}])
+    with pytest.raises(ValueError, match=r"edgeRules\[1\].priority 1 is already used by edgeRules\[0\]"):
+        service("web", edgeRules=[ok, dict(ok)])
+    with pytest.raises(ValueError, match=r"edgeRules\[0\].enabled must be a boolean"):
+        service("web", edgeRules=[{**ok, "enabled": "no"}])
+    with pytest.raises(ValueError, match=r"edgeRules\[0\].mode must be one of enforce"):
+        service("web", edgeRules=[{**ok, "mode": "monitor"}])
+    with pytest.raises(ValueError, match=r"edgeRules\[0\].description must be a string"):
+        service("web", edgeRules=[{**ok, "description": 1}])
+    with pytest.raises(ValueError, match=r"edgeRules\[0\].if is required"):
+        service("web", edgeRules=[{"priority": 1, "then": {"action": "allow"}}])
+    with pytest.raises(ValueError, match=r"edgeRules\[0\].then is required"):
+        service("web", edgeRules=[{"priority": 1, "if": clause}])
+
+    # Conditions: a clause or exactly one combinator.
+    with pytest.raises(ValueError, match=r"edgeRules\[0\].if must be a mapping"):
+        service("web", edgeRules=[{**ok, "if": "http.path == /"}])
+    with pytest.raises(ValueError, match=r"edgeRules\[0\].if must be exactly one of and, or, not"):
+        service("web", edgeRules=[{**ok, "if": {"and": [clause], "or": [clause]}}])
+    with pytest.raises(ValueError, match=r"edgeRules\[0\].if must be exactly one of and, or, not"):
+        service("web", edgeRules=[{**ok, "if": {"not": clause, "attr": "http.path"}}])
+    with pytest.raises(ValueError, match=r"edgeRules\[0\].if.and must be a list"):
+        service("web", edgeRules=[{**ok, "if": {"and": clause}}])
+    with pytest.raises(ValueError, match=r"edgeRules\[0\].if.or\[1\].attr must be a non-empty string"):
+        service("web", edgeRules=[{**ok, "if": {"or": [clause, {"op": "eq", "value": "/"}]}}])
+    with pytest.raises(ValueError, match=r"edgeRules\[0\].if.not.op must be a non-empty string"):
+        service("web", edgeRules=[{**ok, "if": {"not": {"attr": "http.path", "op": "", "value": "/"}}}])
+    with pytest.raises(ValueError, match=r"Unknown edgeRules\[0\].if field\(s\): path"):
+        service("web", edgeRules=[{**ok, "if": {"path": "/"}}])
+    with pytest.raises(ValueError, match=r"edgeRules\[0\].if.value must be a string or a list of strings"):
+        service("web", edgeRules=[{**ok, "if": {**clause, "value": 403}}])
+    with pytest.raises(ValueError, match=r"edgeRules\[0\].if.value must be a string or a list of strings"):
+        service("web", edgeRules=[{**ok, "if": {**clause, "value": ["/", 1]}}])
+    with pytest.raises(ValueError, match=r"edgeRules\[0\].if.key must be a string"):
+        service("web", edgeRules=[{**ok, "if": {**clause, "key": 1}}])
+
+    # Actions.
+    with pytest.raises(ValueError, match=r"edgeRules\[0\].then must be an EdgeRuleThen or a mapping"):
+        service("web", edgeRules=[{**ok, "then": "block"}])
+    with pytest.raises(ValueError, match=r"edgeRules\[0\].then.action must be one of block, allow, challenge, redirect, cache_override"):
+        service("web", edgeRules=[{**ok, "then": {"action": "drop"}}])
+    with pytest.raises(ValueError, match=r"Unknown edgeRules\[0\].then field\(s\): status"):
+        service("web", edgeRules=[{**ok, "then": {"action": "block", "status": 403}}])
+    with pytest.raises(ValueError, match=r"edgeRules\[0\].then.params must be a mapping"):
+        service("web", edgeRules=[{**ok, "then": {"action": "block", "params": 403}}])
+
+    # The dataclasses run the same checks.
+    with pytest.raises(ValueError, match="then.action must be one of"):
+        EdgeRuleThen(action="drop")
+    with pytest.raises(ValueError, match="priority must be an integer"):
+        EdgeRule(priority="1", if_=clause, then=EdgeRuleThen("allow"))
+    with pytest.raises(ValueError, match="mode must be one of enforce"):
+        EdgeRule(1, clause, EdgeRuleThen("allow"), mode="monitor")
 
 
 def test_ref_and_preserve():
