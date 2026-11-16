@@ -5,6 +5,7 @@ from railway_sdk import (
     ServiceCdn,
     bucket,
     create_railway_context,
+    database,
     define_railway,
     fn,
     github,
@@ -17,6 +18,23 @@ from railway_sdk import (
     service,
     volume,
 )
+
+
+def test_database_keeps_explicit_deploy():
+    node = database(
+        "db",
+        "postgres",
+        image="postgres:17",
+        deploy={"replicas": 2, "multiRegionConfig": {"us-west2": {"numReplicas": 2}}},
+        region="us-east4",
+        ignored="dropped",
+    ).to_graph()
+    assert node["deploy"]["replicas"] == 2
+    assert "us-west2" in node["deploy"]["multiRegionConfig"]
+    assert "us-east4" not in node["deploy"]["multiRegionConfig"]
+    assert "ignored" not in node
+    region_only = database("db", "postgres", image="postgres:17", region="us-east4").to_graph()
+    assert region_only["deploy"] == {"multiRegionConfig": {"us-east4": {"numReplicas": 1}}}
 
 
 def test_service_to_graph():
