@@ -447,8 +447,13 @@ def database(name: str, engine: str, **options: Any) -> Service:
     }
     if options.get("defaultMountPath"):
         node["defaultMountPath"] = options["defaultMountPath"]
+    deploy = options.get("deploy")
+    if isinstance(deploy, dict):
+        node["deploy"] = dict(deploy)
     if options.get("region"):
-        node["deploy"] = {"multiRegionConfig": {options["region"]: {"numReplicas": 1}}}
+        # Region is shorthand. An explicit deploy.multiRegionConfig wins.
+        region = {"multiRegionConfig": {options["region"]: {"numReplicas": 1}}}
+        node["deploy"] = {**region, **node.get("deploy", {})}
     return Service(node)
 
 
