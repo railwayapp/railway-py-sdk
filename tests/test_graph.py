@@ -37,6 +37,15 @@ def test_database_keeps_explicit_deploy():
     assert region_only["deploy"] == {"multiRegionConfig": {"us-east4": {"numReplicas": 1}}}
 
 
+def test_null_build_command_is_kept():
+    cleared = service("web", build={"buildCommand": None}).to_graph()
+    assert cleared["build"] == {"buildCommand": None}
+    empty = service("web", build="").to_graph()
+    assert empty["build"] == {"buildCommand": None}
+    kept = service("web", build="npm test").to_graph()
+    assert kept["build"] == {"buildCommand": "npm test"}
+
+
 def test_service_to_graph():
     web = service("web", build="pip install -r requirements.txt", start="gunicorn app:app")
     node = web.to_graph()

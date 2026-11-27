@@ -564,9 +564,13 @@ def _normalize_source(source: Any, root_directory: str | None) -> dict[str, Any]
 def _normalize_build(config: Mapping[str, Any]) -> dict[str, Any] | None:
     build = config.get("build")
     if isinstance(build, str):
-        return {"buildCommand": build}
+        return {"buildCommand": None} if build == "" else {"buildCommand": build}
     if isinstance(build, Mapping):
-        return _prune(dict(build))
+        clear_command = "buildCommand" in build and build.get("buildCommand") in (None, "")
+        pruned = _prune(dict(build)) or {}
+        if clear_command:
+            return {**pruned, "buildCommand": None}
+        return pruned or None
     return None
 
 
