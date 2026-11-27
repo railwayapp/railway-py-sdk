@@ -433,6 +433,9 @@ def mongo(name: str, **config: Any) -> Service:
 
 
 def database(name: str, engine: str, **options: Any) -> Service:
+    unknown = sorted(set(options) - {"image", "output", "defaultMountPath", "deploy", "region"})
+    if unknown:
+        raise TypeError(f"database() got unexpected keyword argument(s): {', '.join(unknown)}")
     image_name = options["image"]
     output = options.get("output") or "DATABASE_URL"
     node: dict[str, Any] = {
